@@ -2,5 +2,12 @@
 name = "coda"
 version = "0.1.0"
 edition = "2021"
+default-run = "spreadsheet"
+
+[[bin]]
+name = "spreadsheet"
+test = false
+bench = false
 
 [dependencies]
+anyhow = "1.0.80"

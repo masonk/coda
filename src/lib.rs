@@ -1,3 +1,5 @@
+#![feature(hash_raw_entry)]
+
 pub fn add(left: usize, right: usize) -> usize {
     left + right
 }
