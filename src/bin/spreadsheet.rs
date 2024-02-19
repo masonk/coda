@@ -14,34 +14,27 @@ enum CachedValue {
 
 struct GridCell {
     cache: RefCell<CachedValue>,
-    formula: Box<dyn CellFormula<Val>>,
+    formula: CellFormula,
 }
 
-trait CellFormula<T> {
-    fn ref_cells(&self) -> Option<HashSet<Id>>;
-    fn compute_cell_value(&self, sheet: &Spreadsheet) -> Result<T>;
+enum CellFormula {
+    Literal(Val),
+    Sum2(Id, Id),
 }
-
-struct Literal(Val);
-impl CellFormula<Val> for Literal {
+impl CellFormula {
     fn ref_cells(&self) -> Option<HashSet<Id>> {
-        None
-    }
-    fn compute_cell_value(&self, _: &Spreadsheet) -> Result<Val> {
-        Ok(self.0)
-    }
-}
-
-struct Sum2(Id, Id);
-impl CellFormula<Val> for Sum2 {
-    fn ref_cells(&self) -> Option<HashSet<Id>> {
-        Some(HashSet::from([self.0, self.1]))
+        match self {
+            CellFormula::Literal(_) => None,
+            CellFormula::Sum2(id1, id2) => Some(HashSet::from([*id1, *id2])),
+        }
     }
     fn compute_cell_value(&self, sheet: &Spreadsheet) -> Result<Val> {
-        Ok(sheet.get(&self.0)? + sheet.get(&self.1)?)
+        match self {
+            CellFormula::Literal(v) => Ok(*v),
+            CellFormula::Sum2(id1, id2) => Ok(sheet.get(id1)? + sheet.get(id2)?),
+        }
     }
 }
-
 /*
 Problem Statement:
 
@@ -56,7 +49,6 @@ Define an api for
 
 NOTE: The solution here slightly generalizes the problem statement.
 
-It
 */
 struct Spreadsheet {
     pub(crate) rdeps: CellLookup,
@@ -124,7 +116,7 @@ impl Spreadsheet {
         return computed;
     }
 
-    pub fn set_val(&mut self, id: &Id, formula: Box<dyn CellFormula<Val>>) -> Result<()> {
+    pub fn set_val(&mut self, id: &Id, formula: CellFormula) -> Result<()> {
         self.max_row = self.max_row.max(id.0);
         self.max_col = self.max_col.max(id.1);
         /*
@@ -202,8 +194,8 @@ impl Display for Spreadsheet {
     }
 }
 fn main() -> Result<()> {
-    fn lit(v: Val) -> Box<dyn CellFormula<Val>> {
-        Box::new(Literal(v))
+    fn lit(v: Val) -> CellFormula {
+        CellFormula::Literal(v)
     }
     let mut spreadsheet = Spreadsheet::new();
     for i in 0..=10 {
@@ -215,7 +207,7 @@ fn main() -> Result<()> {
         spreadsheet.set_val(&(0, i), lit(1))?;
     }
     for i in 2..=10 {
-        spreadsheet.set_val(&(0, i), Box::new(Sum2((0, i - 1), (0, i - 2))))?;
+        spreadsheet.set_val(&(0, i), CellFormula::Sum2((0, i - 1), (0, i - 2)))?;
     }
 
     println!("{}", spreadsheet);
@@ -225,11 +217,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn lit(v: Val) -> Box<dyn CellFormula<Val>> {
-        Box::new(Literal(v))
+    fn lit(v: Val) -> CellFormula {
+        CellFormula::Literal(v)
     }
-    fn sum(id1: Id, id2: Id) -> Box<dyn CellFormula<Val>> {
-        Box::new(Sum2(id1, id2))
+    fn sum(id1: Id, id2: Id) -> CellFormula {
+        CellFormula::Sum2(id1, id2)
     }
 
     #[test]
@@ -259,7 +251,7 @@ mod tests {
 
         for i in 0..=10 {
             let id = (i, 0);
-            actual.set_val(&id, Box::new(Sum2((i, 1), (i, 2))))?;
+            actual.set_val(&id, CellFormula::Sum2((i, 1), (i, 2)))?;
         }
         for i in 0..=10 {
             let id = (i, 0);
