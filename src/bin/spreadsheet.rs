@@ -132,12 +132,6 @@ impl Spreadsheet {
         4. Mark the starting cell as either CyclicReference or Dirty.
         TODO: other cells might still be cyclic
          */
-
-        if let Some(rdeps) = formula.ref_cells() {
-            for d in rdeps {
-                self.rdeps.entry(d).or_default().insert(*id);
-            }
-        };
         if let Some(current) = self.vals.get(id) {
             // If the cell we're updating referenced other cells,
             // it no longer necessarily references those same cells now.
@@ -149,6 +143,12 @@ impl Spreadsheet {
                 }
             }
         }
+        if let Some(rdeps) = formula.ref_cells() {
+            for d in rdeps {
+                self.rdeps.entry(d).or_default().insert(*id);
+            }
+        };
+
         let has_cycle = self.check_for_cycle_and_dirty_rdeps(id);
 
         let value = match has_cycle {
