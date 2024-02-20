@@ -11,3 +11,4 @@ bench = false
 
 [dependencies]
 anyhow = "1.0.80"
+thiserror = "1.0.57"

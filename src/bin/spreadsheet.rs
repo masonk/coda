@@ -1,32 +1,55 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
+use thiserror::Error;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 type Val = usize;
 type Id = (usize, usize); // (row, col)
 type CellLookup = HashMap<Id, HashSet<Id>>;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum CachedValue {
     Cached(Val),
     Dirty,
+    Invalid,
 }
 
+#[derive(Debug)]
 struct GridCell {
     cache: RefCell<CachedValue>,
     formula: CellFormulas,
 }
 
-trait CellFormula {
+pub trait CellFormula {
     fn ref_cells(&self) -> Option<HashSet<Id>>;
-    fn compute_cell_value(&self, sheet: &Spreadsheet) -> Result<Val>;
+    fn compute_cell_value(&self, sheet: &Spreadsheet) -> std::result::Result<Val, AccessError>;
 }
 
-enum CellFormulas {
+pub trait CustomCellFormula: CellFormula + Debug {}
+impl<T: CellFormula + Debug> CustomCellFormula for T {}
+
+#[derive(Debug)]
+pub enum CellFormulas {
     Literal(Val),
     Sum2(Id, Id),
-    Custom(Box<dyn CellFormula>),
+    Custom(Box<dyn CustomCellFormula>),
 }
+
+#[derive(Error, Debug)]
+pub enum SetError {}
+
+#[derive(Error, Debug)]
+pub enum AccessError {
+    #[error("Cannot compute through a reference cycle.")]
+    CyclicReference,
+    #[error("Cell is uninitialized")]
+    Uninitialized,
+    #[error("Reference to an invalid cell.")]
+    InvalidReference,
+}
+
 impl CellFormula for CellFormulas {
     fn ref_cells(&self) -> Option<HashSet<Id>> {
         use CellFormulas::*;
@@ -37,12 +60,13 @@ impl CellFormula for CellFormulas {
             Custom(b) => b.ref_cells(),
         }
     }
-    fn compute_cell_value(&self, sheet: &Spreadsheet) -> Result<Val> {
+    fn compute_cell_value(&self, sheet: &Spreadsheet) -> std::result::Result<Val, AccessError> {
+        use AccessError::*;
         use CellFormulas::*;
-
         match self {
             Literal(v) => Ok(*v),
-            Sum2(id1, id2) => Ok(sheet.get(id1)? + sheet.get(id2)?),
+            Sum2(id1, id2) => Ok(sheet.get(id1).map_err(|_| InvalidReference)?
+                + sheet.get(id2).map_err(|_| InvalidReference)?),
             Custom(b) => b.compute_cell_value(sheet),
         }
     }
@@ -60,10 +84,11 @@ Define an api for
 - Setting a cell to one of its allowable values
 - Retrieving a cell's current value
 
-NOTE: The solution here slightly generalizes the problem statement.
+NOTE: The solution here slightly generalizes the problem statement. It handles invalid and cyclic references.
+Additionally, it has support for arbitrary user-defined formulas, not just summing two numbers.
 
 */
-struct Spreadsheet {
+pub struct Spreadsheet {
     pub(crate) rdeps: CellLookup,
     pub(crate) vals: HashMap<Id, GridCell>,
     max_col: usize,
@@ -79,9 +104,69 @@ impl Spreadsheet {
         }
     }
 
-    // Recursively dirty the rdeps of id, if there is no dependency cycle
-    // If there is, don't dirty anything and return Err.
-    fn check_cycles_or_mark_descendants_as_dirty(self: &Self, id: &Id) -> Result<()> {
+    pub fn get(&self, id: &Id) -> std::result::Result<Val, AccessError> {
+        let cell_val = self.vals.get(id).ok_or(AccessError::Uninitialized)?;
+
+        match *cell_val.cache.borrow() {
+            CachedValue::Cached(v) => return Ok(v),
+            CachedValue::Invalid => return Err(AccessError::CyclicReference),
+            _ => {}
+        };
+        let computed = cell_val.formula.compute_cell_value(self);
+        match computed {
+            Ok(v) => (*cell_val.cache.borrow_mut()) = CachedValue::Cached(v),
+            _ => {} // TODO: Can also cache errors
+        };
+        return computed;
+    }
+
+    pub fn set_val(&mut self, id: &Id, formula: CellFormulas) -> std::result::Result<(), SetError> {
+        self.max_row = self.max_row.max(id.0);
+        self.max_col = self.max_col.max(id.1);
+        /*
+        1.Update the spreadsheet with the new rdeps that will exist after this cell is updated.
+        2. Transitively visit all of the rdeps of the cell we're starting from.
+        3. Note if we reached back to the starting point during the traversal.
+        3a. If we reached the starting point, we just traveled a dep cycle. Mark every cell in the cycle as a CyclicReference.
+        3b. If we didn't reach the starting point, the cells are normal. Mark all the rdeps as dirty.
+        4. Mark the starting cell as either CyclicReference or Dirty.
+        TODO: other cells might still be cyclic
+         */
+
+        if let Some(rdeps) = formula.ref_cells() {
+            for d in rdeps {
+                self.rdeps.entry(d).or_default().insert(*id);
+            }
+        };
+        if let Some(current) = self.vals.get(id) {
+            // If the cell we're updating referenced other cells,
+            // it no longer necessarily references those same cells now.
+            if let Some(rdeps) = current.formula.ref_cells() {
+                for rdep in rdeps {
+                    self.rdeps.entry(rdep).and_modify(|set| {
+                        set.remove(&id);
+                    });
+                }
+            }
+        }
+        let has_cycle = self.check_for_cycle_and_dirty_rdeps(id);
+
+        let value = match has_cycle {
+            true => CachedValue::Invalid,
+            false => CachedValue::Dirty,
+        };
+        self.vals.insert(
+            *id,
+            GridCell {
+                cache: RefCell::new(value),
+                formula,
+            },
+        );
+        Ok(())
+    }
+
+    // Recursively dirty the rdeps of id. If there is a dependency cycle, return true, else false.
+    fn check_for_cycle_and_dirty_rdeps(self: &Self, id: &Id) -> bool {
         let mut seen = HashSet::new();
 
         // Note: deliberately not add the starting cell id to the list of visited cells.
@@ -90,14 +175,26 @@ impl Spreadsheet {
         // In that case, the update will be rejected, and the state shouldn't change. Nothing
         // should be marked as dirty.
         self.update_rdeps_recursive(id, &mut seen);
+
+        let update_value = if seen.contains(id) {
+            CachedValue::Invalid
+        } else {
+            CachedValue::Dirty
+        };
+
         if seen.contains(id) {
-            bail!("Update would create a dependency cycle");
+            let mut invalid: Vec<usize> = seen.iter().map(|(v, _)| *v).collect();
+            invalid.sort();
         }
+
         for id in &seen {
             let cell = self.vals.get(id).unwrap();
-            *cell.cache.borrow_mut() = CachedValue::Dirty;
+            *cell.cache.borrow_mut() = update_value;
         }
-        Ok(())
+        if seen.contains(id) {
+            return true;
+        }
+        return false;
     }
 
     fn update_rdeps_recursive(self: &Self, id: &Id, seen: &mut HashSet<Id>) {
@@ -113,74 +210,6 @@ impl Spreadsheet {
     fn collect_dirty(self: &Self, id: &Id, seen: &mut HashSet<Id>) {
         seen.insert(*id);
         self.update_rdeps_recursive(id, seen);
-    }
-
-    pub fn get(&self, id: &Id) -> Result<Val> {
-        let cell_val = self.vals.get(id).ok_or(anyhow!("(uninit)"))?;
-
-        if let CachedValue::Cached(v) = *cell_val.cache.borrow() {
-            return Ok(v);
-        }
-        let computed = cell_val.formula.compute_cell_value(self);
-        match computed {
-            Ok(v) => (*cell_val.cache.borrow_mut()) = CachedValue::Cached(v),
-            _ => {} // TODO: Can also cache errors
-        };
-        return computed;
-    }
-
-    pub fn set_val(&mut self, id: &Id, formula: CellFormulas) -> Result<()> {
-        self.max_row = self.max_row.max(id.0);
-        self.max_col = self.max_col.max(id.1);
-        /*
-        1. Speculatively update the spreadsheet with the new rdeps that this update would create.
-        2. Transitively visit all of the rdeps of the cell we're trying to update.
-        2a. If we reach the cell we're trying to update would become a transitive reverse dep of it self, that means it's also a dep of itself. This is invalid. Roll back the speculative change to rdeps, and return an error.
-        2b. If we don't reach the cell we're trying to update, no cycles are being created. Don't roll back the speculative change to rdeps. Instead, mark all of the transitive rdeps of this cell as dirty.
-        3. Add this cell and mark it as dirty.
-         */
-
-        if let Some(rdeps) = formula.ref_cells() {
-            for d in rdeps {
-                self.rdeps.entry(d).or_default().insert(*id);
-            }
-        };
-
-        match self.check_cycles_or_mark_descendants_as_dirty(id) {
-            Ok(_) => {
-                if let Some(current) = self.vals.get(id) {
-                    // If the cell is currently a Sum, then it's about to stop depending on two other cells.
-                    // Update the other cell's rdep set to remove the cell we're mutating.
-                    if let Some(rdeps) = current.formula.ref_cells() {
-                        for rdep in rdeps {
-                            self.rdeps.entry(rdep).and_modify(|set| {
-                                set.remove(&id);
-                            });
-                        }
-                    }
-                }
-
-                self.vals.insert(
-                    *id,
-                    GridCell {
-                        cache: RefCell::new(CachedValue::Dirty),
-                        formula,
-                    },
-                );
-            }
-            Err(_) => {
-                // We may have speculatively added some rdeps to check if they'd create cycles.
-                // If we got here, it means they did, so we have to roll back.
-                if let Some(rdeps) = formula.ref_cells() {
-                    for d in rdeps {
-                        self.rdeps.entry(d).or_default().remove(id);
-                    }
-                }
-                bail!("Did not set value, as doing so would have created a dependency cycle.");
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -198,7 +227,14 @@ impl Display for Spreadsheet {
             for j in 0..=self.max_col {
                 match self.get(&(i, j)) {
                     Ok(v) => write!(f, "{:^12}|", v)?,
-                    Err(e) => write!(f, "{:^12}|", e.to_string())?,
+                    Err(e) => {
+                        use AccessError::*;
+                        match e {
+                            InvalidReference => write!(f, "{:^12}|", "#REF")?,
+                            Uninitialized => write!(f, "{:^12}|", "")?,
+                            CyclicReference => write!(f, "{:^12}|", "#CYCLE")?,
+                        }
+                    }
                 };
             }
             write!(f, "\n")?;
@@ -207,8 +243,9 @@ impl Display for Spreadsheet {
     }
 }
 fn main() -> Result<()> {
+    use CellFormulas::*;
     fn lit(v: Val) -> CellFormulas {
-        CellFormulas::Literal(v)
+        Literal(v)
     }
     let mut spreadsheet = Spreadsheet::new();
     for i in 0..=10 {
@@ -220,10 +257,20 @@ fn main() -> Result<()> {
         spreadsheet.set_val(&(0, i), lit(1))?;
     }
     for i in 2..=10 {
-        spreadsheet.set_val(&(0, i), CellFormulas::Sum2((0, i - 1), (0, i - 2)))?;
+        spreadsheet.set_val(&(0, i), Sum2((0, i - 1), (0, i - 2)))?;
     }
 
+    spreadsheet.set_val(&(5, 5), Sum2((3, 3), (7, 7)))?;
+    spreadsheet.set_val(&(7, 7), Sum2((2, 2), (4, 4)))?;
+    spreadsheet.set_val(&(4, 4), Sum2((2, 2), (5, 5)))?;
+    spreadsheet.set_val(&(7, 3), Sum2((50, 50), (0, 0)))?;
+
     println!("{}", spreadsheet);
+
+    spreadsheet.set_val(&(4, 4), Sum2((0, 0), (1, 1)))?;
+
+    println!("{}", spreadsheet);
+
     Ok(())
 }
 
@@ -281,7 +328,7 @@ mod tests {
         actual.set_val(&(0, 0), lit(0))?;
         actual.set_val(&(1, 0), lit(1))?;
         for i in 2..=1000 {
-            // fib(1000) is an enormous number. If we were eager computing it this test would never finish.
+            // fib(1000) is an enormous number. If we were eager computing it this test would never finish or would panic on overflow.
             // So implicitly we are testing that cell computation is lazy.
             actual.set_val(&(i, 0), sum((i - 1, 0), (i - 2, 0)))?;
         }
@@ -313,25 +360,60 @@ mod tests {
 
             match *actual.vals.get(&id).unwrap().cache.borrow() {
                 CachedValue::Cached(_) => {}
-                _ => assert!(false, "Something was dirty but all should be cached."),
+                _ => assert!(false, "cell {:?} wasn't cached, but should have been", id),
             }
-            // Force computation so everything is cached.
-            // This is to validate that attempting to add a cycle doesn't dirty anything.
         }
 
-        // 10 transitively depends on 0. So if 0 were to start depending on 10, that'd be a cycle.
-        let result = actual.set_val(&(0, 0), sum((10, 0), (11, 0)));
+        // 9 and 10 transitively depend on 0. So if 0 were to start depending on those, that'd be a cycle.
+        actual.set_val(&(0, 0), sum((10, 0), (9, 0)))?;
+
+        assert_eq!(
+            *actual.vals.get(&(0, 0)).unwrap().cache.borrow(),
+            CachedValue::Invalid
+        );
+        // 1 is still cached because it doesn't reference anything.
+        assert_eq!(
+            *actual.vals.get(&(1, 0)).unwrap().cache.borrow(),
+            CachedValue::Cached(1)
+        );
+
+        for i in 2..=10 {
+            let id = (i, 0);
+            assert_eq!(
+                *actual.vals.get(&id).unwrap().cache.borrow(),
+                CachedValue::Invalid
+            );
+        }
+
+        // Fixing one of two broken refs shouldn't fix the cycle.
+        actual.set_val(&(9, 0), lit(42))?;
+        // ERROR: this marks the cycle as dirty, but it shouldn't.
+        // The cycle is still invalid, but the detection logic only sees that 9 is now fine and doesn't realize that the other nodes are still in a cycle.
+
+        for i in 2..=10 {
+            let id = (i, 0);
+            assert_eq!(
+                *actual.vals.get(&id).unwrap().cache.borrow(),
+                CachedValue::Invalid
+            );
+            match actual.get(&id) {
+                Ok(_) => assert!(false, "{:?}: shouldn't be fixed yet", id),
+                Err(_) => {}
+            };
+        }
+
+        // this should fix the cycle. Now make sure everything is valid again.
+        actual.set_val(&(10, 0), lit(42))?;
+        // actual.set_val(&(0, 0), lit(42))?;
         for i in 0..=10 {
             let id = (i, 0);
 
-            match *actual.vals.get(&id).unwrap().cache.borrow() {
-                CachedValue::Cached(_) => {}
-                _ => assert!(false, "Something was dirty but all should be cached."),
-            }
-            // Force computation so everything is cached.
-            // This is to validate that attempting to add a cycle doesn't dirty anything.
+            match actual.get(&id) {
+                Ok(_) => {}
+                Err(e) => assert!(false, "{:?}: Got error {:?}, but shouldn't have", id, e),
+            };
         }
-        assert!(result.is_err());
+
         Ok(())
     }
 
@@ -396,6 +478,42 @@ mod tests {
         actual.set_val(&(56, 0), lit(0))?;
 
         assert_eq!(actual.get(&(57, 0)).unwrap(), fib55); // fib57 = fib55 + fib56 = fib55 + 0
+        Ok(())
+    }
+
+    #[test]
+    fn custom_formula() -> Result<()> {
+        #[derive(Debug)]
+        struct Square(Id);
+        impl CellFormula for Square {
+            fn compute_cell_value(
+                &self,
+                sheet: &Spreadsheet,
+            ) -> std::result::Result<Val, AccessError> {
+                let v = sheet
+                    .get(&self.0)
+                    .map_err(|_| AccessError::InvalidReference)?;
+                Ok(v * v)
+            }
+
+            fn ref_cells(&self) -> Option<HashSet<Id>> {
+                let mut set = HashSet::new();
+                set.insert(self.0);
+                Some(set)
+            }
+        }
+        let mut actual = Spreadsheet::new();
+
+        for i in 0..=10 {
+            let row1 = (i, 0);
+            let row2 = (i, 1);
+            actual.set_val(&row1, lit(i))?;
+            actual.set_val(&row2, CellFormulas::Custom(Box::new(Square(row1))))?;
+        }
+        for i in 0..=10 {
+            assert_eq!(actual.get(&(i, 1)).unwrap(), i * i);
+        }
+
         Ok(())
     }
 }
