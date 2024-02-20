@@ -14,27 +14,40 @@ enum CachedValue {
 
 struct GridCell {
     cache: RefCell<CachedValue>,
-    formula: CellFormula,
+    formula: CellFormulas,
 }
 
-enum CellFormula {
+trait CellFormula {
+    fn ref_cells(&self) -> Option<HashSet<Id>>;
+    fn compute_cell_value(&self, sheet: &Spreadsheet) -> Result<Val>;
+}
+
+enum CellFormulas {
     Literal(Val),
     Sum2(Id, Id),
+    Custom(Box<dyn CellFormula>),
 }
-impl CellFormula {
+impl CellFormula for CellFormulas {
     fn ref_cells(&self) -> Option<HashSet<Id>> {
+        use CellFormulas::*;
+
         match self {
-            CellFormula::Literal(_) => None,
-            CellFormula::Sum2(id1, id2) => Some(HashSet::from([*id1, *id2])),
+            Literal(_) => None,
+            Sum2(id1, id2) => Some(HashSet::from([*id1, *id2])),
+            Custom(b) => b.ref_cells(),
         }
     }
     fn compute_cell_value(&self, sheet: &Spreadsheet) -> Result<Val> {
+        use CellFormulas::*;
+
         match self {
-            CellFormula::Literal(v) => Ok(*v),
-            CellFormula::Sum2(id1, id2) => Ok(sheet.get(id1)? + sheet.get(id2)?),
+            Literal(v) => Ok(*v),
+            Sum2(id1, id2) => Ok(sheet.get(id1)? + sheet.get(id2)?),
+            Custom(b) => b.compute_cell_value(sheet),
         }
     }
 }
+
 /*
 Problem Statement:
 
@@ -116,7 +129,7 @@ impl Spreadsheet {
         return computed;
     }
 
-    pub fn set_val(&mut self, id: &Id, formula: CellFormula) -> Result<()> {
+    pub fn set_val(&mut self, id: &Id, formula: CellFormulas) -> Result<()> {
         self.max_row = self.max_row.max(id.0);
         self.max_col = self.max_col.max(id.1);
         /*
@@ -194,8 +207,8 @@ impl Display for Spreadsheet {
     }
 }
 fn main() -> Result<()> {
-    fn lit(v: Val) -> CellFormula {
-        CellFormula::Literal(v)
+    fn lit(v: Val) -> CellFormulas {
+        CellFormulas::Literal(v)
     }
     let mut spreadsheet = Spreadsheet::new();
     for i in 0..=10 {
@@ -207,7 +220,7 @@ fn main() -> Result<()> {
         spreadsheet.set_val(&(0, i), lit(1))?;
     }
     for i in 2..=10 {
-        spreadsheet.set_val(&(0, i), CellFormula::Sum2((0, i - 1), (0, i - 2)))?;
+        spreadsheet.set_val(&(0, i), CellFormulas::Sum2((0, i - 1), (0, i - 2)))?;
     }
 
     println!("{}", spreadsheet);
@@ -217,11 +230,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn lit(v: Val) -> CellFormula {
-        CellFormula::Literal(v)
+    fn lit(v: Val) -> CellFormulas {
+        CellFormulas::Literal(v)
     }
-    fn sum(id1: Id, id2: Id) -> CellFormula {
-        CellFormula::Sum2(id1, id2)
+    fn sum(id1: Id, id2: Id) -> CellFormulas {
+        CellFormulas::Sum2(id1, id2)
     }
 
     #[test]
@@ -251,7 +264,7 @@ mod tests {
 
         for i in 0..=10 {
             let id = (i, 0);
-            actual.set_val(&id, CellFormula::Sum2((i, 1), (i, 2)))?;
+            actual.set_val(&id, CellFormulas::Sum2((i, 1), (i, 2)))?;
         }
         for i in 0..=10 {
             let id = (i, 0);
